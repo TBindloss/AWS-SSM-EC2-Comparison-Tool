@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deployment document for SSM & EC2 comparison tool.
+Parameters:
+  SNSTopic:
+    Type: String
+    Description: SNS Topic ARN to send notifications to.
+    Default: arn:aws:sns:REGION:MASTER-ACCOUNT-NUMBER:SNSTopic
+Resources:
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SSMCheck
+      Runtime: python3.10
+      Timeout: 120
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC: !Ref SNSTopic
+      Code:
+        ZipFile: |
+            import boto3
+            import json
+            import os
+
+            ssm_client = boto3.client('ssm')
+            ec2_client = boto3.client('ec2')
+            sns_client = boto3.client('sns')
+            sts_client = boto3.client('sts')
+            account_id = sts_client.get_caller_identity()["Account"]
+            counter = 0
+
+            def has_excluded_tag(tags):
+                for tag in tags:
+                    if tag['Key'] == 'SSMCheck' and tag['Value'] == 'Excluded':
+                        return True
+                return False
+
+            def get_ec2_instance_name(instance_id):
+                ec2_instance = ec2_client.describe_instances(InstanceIds=[instance_id])
+                return ec2_instance['Reservations'][0]['Instances'][0]['Tags'][0]['Value']
+
+            def lambda_handler(event, context):
+                global counter
+
+                ec2_instances = ec2_client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+                ec2_instance_ids = []
+                for reservations in ec2_instances['Reservations']:
+                    for instance in reservations['Instances']:
+                        if has_excluded_tag(instance.get('Tags', [])):
+                            continue
+
+                        ec2_instance_ids.append(instance['InstanceId'])
+
+                ssm_instance_ids = []
+                ssm_instances = ssm_client.describe_instance_information()
+                for instance_info in ssm_instances['InstanceInformationList']:
+                    ssm_instance_ids.append(instance_info['InstanceId'])
+
+                for ec2_instance in ec2_instance_ids:
+                    if ec2_instance not in ssm_instance_ids:
+                        counter += 1
+                        instance_name = get_ec2_instance_name(ec2_instance)
+                        Message = f"The EC2 instance '{instance_name}' ({ec2_instance}) in account {account_id} is not registered in Systems Manager. Please ensure the Systems Manager software is running and an appropriate IAM role is assigned. You can also add the tags 'SSMCheck' 'Excluded' if you want don't want to check this instance in the future."
+                        sns_client.publish(
+                            TopicArn=os.getenv('SNS_TOPIC'),
+                            Subject=f"{instance_name}: Not registered in Systems Manager.",
+                            Message=json.dumps({'default': json.dumps(Message)}),
+                            MessageStructure='json'
+                        )
+                        print(f"{ec2_instance} has been reported.")
+                
+                print(f"{counter} instance(s) were reported.")
+            counter = 0
+
+  Trigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SSMCheck_CRON
+      ScheduleExpression: cron(0 13 ? * Mon *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: SSMCheckTrigger
+      EventBusName: default
+      EventPattern:
+        source:
+          - "aws.events"
+        detail-type:
+          - "Scheduled Event"
+        resources:
+          - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/Trigger 
+  TriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Trigger.Arn
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 
+        Fn::Sub: "SSMCheck_Role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName:
+            Fn::Sub: "SSMCheck_Policy-${AWS::Region}"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: "EC2DescribeInstances"
+                Effect: "Allow"
+                Action: "ec2:DescribeInstances"
+                Resource: "*"
+              - Sid: "SSMDescribeInstanceInformation"
+                Effect: "Allow"
+                Action: "ssm:DescribeInstanceInformation"
+                Resource: "*"
+              - Sid: "SNSPublish"
+                Effect: "Allow"
+                Action: "sns:Publish"
+                Resource: !Ref SNSTopic
+              - Sid: "STSGetCallerIdentity"
+                Effect: "Allow"
+                Action: "sts:GetCallerIdentity"
+                Resource: "*"

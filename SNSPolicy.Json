@@ -1,0 +1,17 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "1 Accounts",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": [
+            "arn:aws:iam::SENDING-ACCOUNT-NUMBER1:root",
+            "arn:aws:iam::SENDING-ACCOUNT-NUMBER2:root"
+          ]
+        },
+        "Action": "sns:Publish",
+        "Resource": "arn:aws:sns:eu-west-1:THISACCOUNT:THISTOPIC"
+      }
+    ]
+}
